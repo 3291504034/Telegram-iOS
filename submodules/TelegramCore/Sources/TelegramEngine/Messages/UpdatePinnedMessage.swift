@@ -14,6 +14,14 @@ public enum PinnedMessageUpdate {
     case clear(id: MessageId)
 }
 
+/// DIY build: pin-limit bypass.
+/// The client refuses to send `messages.updatePinnedMessage` when it believes the
+/// account lacks pin rights (no `canPinMessages`, a `banPinMessages` default right,
+/// or a cached `canPinMessages == false`). That gate is what blocks pinning past the
+/// limit the app applies locally. With this set the permission check is skipped and
+/// the request is always sent; the server remains the final authority.
+private let diySkipPinPermissionCheck = true
+
 func _internal_requestUpdatePinnedMessage(account: Account, peerId: PeerId, update: PinnedMessageUpdate) -> Signal<Void, UpdatePinnedMessageError> {
     return account.postbox.transaction { transaction -> (Peer?, CachedPeerData?) in
         return (transaction.getPeer(peerId), transaction.getPeerCachedData(peerId: peerId))
@@ -25,25 +33,27 @@ func _internal_requestUpdatePinnedMessage(account: Account, peerId: PeerId, upda
             return .fail(.generic)
         }
         
-        if let channel = peer as? TelegramChannel {
-            let canManagePin = channel.hasPermission(.pinMessages)
-            if !canManagePin {
-                return .fail(.generic)
-            }
-        } else if let group = peer as? TelegramGroup {
-            switch group.role {
-            case .creator, .admin:
-                break
-            default:
-                if let defaultBannedRights = group.defaultBannedRights {
-                    if defaultBannedRights.flags.contains(.banPinMessages) {
-                        return .fail(.generic)
+        if !diySkipPinPermissionCheck {
+            if let channel = peer as? TelegramChannel {
+                let canManagePin = channel.hasPermission(.pinMessages)
+                if !canManagePin {
+                    return .fail(.generic)
+                }
+            } else if let group = peer as? TelegramGroup {
+                switch group.role {
+                case .creator, .admin:
+                    break
+                default:
+                    if let defaultBannedRights = group.defaultBannedRights {
+                        if defaultBannedRights.flags.contains(.banPinMessages) {
+                            return .fail(.generic)
+                        }
                     }
                 }
-            }
-        } else if let _ = peer as? TelegramUser, let cachedPeerData = cachedPeerData as? CachedUserData {
-            if !cachedPeerData.canPinMessages {
-                return .fail(.generic)
+            } else if let _ = peer as? TelegramUser, let cachedPeerData = cachedPeerData as? CachedUserData {
+                if !cachedPeerData.canPinMessages {
+                    return .fail(.generic)
+                }
             }
         }
             

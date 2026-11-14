@@ -1,6 +1,11 @@
 import Foundation
 import Postbox
 
+/// DIY build: pin-limit bypass.
+/// When set, `hasPermission(.pinMessages)` always reports true so the UI offers pinning
+/// regardless of admin rights or default-banned rights. The server remains authoritative.
+let diyBypassPinPermissionChecks = true
+
 public enum TelegramChannelPermission {
     case sendText
     case sendPhoto
@@ -130,6 +135,11 @@ public extension TelegramChannel {
                     return true
                 }
             case .pinMessages:
+                // DIY build: pin-limit bypass. Always report pin rights so the UI offers
+                // the action and the request is attempted; the server stays authoritative.
+                if diyBypassPinPermissionChecks {
+                    return true
+                }
                 if case .broadcast = self.info {
                     if let adminRights = self.adminRights {
                         return adminRights.rights.contains(.canPinMessages) || adminRights.rights.contains(.canEditMessages)

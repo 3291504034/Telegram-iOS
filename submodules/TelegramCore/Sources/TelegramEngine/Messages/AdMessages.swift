@@ -476,11 +476,21 @@ private class AdMessagesHistoryContextImpl {
         self.maskAsSeenDisposables.dispose()
     }
     
+    /// DIY build: ad removal.
+    /// Sponsored and recommended messages are never requested, parsed or cached.
+    /// `activate()` is the only place this class fetches ad data, so it short-circuits there.
+    private static let adsDisabled = true
+
     func activate() {
         if self.isActivated {
             return
         }
         self.isActivated = true
+        
+        if AdMessagesHistoryContextImpl.adsDisabled {
+            self.stateValue = State(interPostInterval: nil, messages: [])
+            return
+        }
         
         let peerId = self.peerId
         let accountPeerId = self.account.peerId
