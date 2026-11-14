@@ -1,0 +1,139 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'Display version (leave empty to use versions.json)'
+        required: false
+        default: ''
+      build_number:
+        description: 'Build number (leave empty for commit count)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macOS 27.0.1 + Xcode 27.1 (default) - matches versions.json { macos: 27, xcode: 27.1 }
+    runs-on: xcode-27-arm64
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show toolchain
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          python3 --version
+
+      - name: Select Xcode from versions.json
+        run: |
+          set -eux
+          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["xcode"])')
+          echo "versions.json wants Xcode_$XCODE_VERSION"
+          for candidate in "/Applications/Xcode_$XCODE_VERSION.app" "/Applications/Xcode.app"; do
+            if [ -d "$candidate" ]; then
+              sudo xcode-select -s "$candidate/Contents/Developer"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Canonical source directory
+        run: |
+          set -eux
+          sudo mkdir -p /Users/Shared
+          sudo rm -rf /Users/Shared/telegram-ios
+          sudo cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+          sudo chown -R "$(whoami)" /Users/Shared/telegram-ios
+          du -sh /Users/Shared/telegram-ios
+
+      - name: Build (unsigned, fake codesigning)
+        run: |
+          set -eux
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+          cd "$SOURCE_DIR"
+
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          APP_VERSION="${APP_VERSION_INPUT:-$(cat versions.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["app"])')}"
+          if [ -n "${BUILD_NUMBER_INPUT:-}" ]; then
+            BUILD_NUMBER="$BUILD_NUMBER_INPUT"
+          else
+            COMMIT_COUNT=$(git rev-list --count HEAD)
+            BUILD_NUMBER="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
+          fi
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+          echo "BAZEL_USER_ROOT=$BAZEL_USER_ROOT" >> "$GITHUB_ENV"
+
+          # self-signed cert + fake provisioning profiles -> unsigned .ipa, re-signed afterwards (e.g. ESign)
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            build \
+            --configurationPath="build-system/diy-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+        env:
+          APP_VERSION_INPUT: ${{ inputs.app_version }}
+          BUILD_NUMBER_INPUT: ${{ inputs.build_number }}
+
+      - name: Collect IPA and dSYMs
+        run: |
+          set -eux
+          cd "$SOURCE_DIR"
+          OUTPUT_PATH="$SOURCE_DIR/build/artifacts"
+          rm -rf "$OUTPUT_PATH"; mkdir -p "$OUTPUT_PATH"
+
+          IPA_COUNT=$(ls -1 bazel-bin/Telegram/Telegram.ipa 2>/dev/null | wc -l | tr -d ' ')
+          echo "ipa candidates: $IPA_COUNT"
+          cp bazel-bin/Telegram/Telegram.ipa "$OUTPUT_PATH/Telegram.ipa"
+          ls -lh "$OUTPUT_PATH/Telegram.ipa"
+
+          mkdir -p "$SOURCE_DIR/build/DSYMs"
+          for f in bazel-bin/Telegram/*.dSYM; do [ -e "$f" ] && cp -R "$f" "$SOURCE_DIR/build/DSYMs/"; done
+          ( cd "$SOURCE_DIR/build" && zip -qr "$OUTPUT_PATH/Telegram.DSYMs.zip" DSYMs ) || true
+
+          # sanity: must be an arm64 device slice
+          unzip -l "$OUTPUT_PATH/Telegram.ipa" | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-unsigned-${{ env.APP_VERSION }}-${{ env.BUILD_NUMBER }}
+          path: |
+            /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
+            /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          TAG="build-$BUILD_NUMBER"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$SOURCE_DIR/build/artifacts/Telegram.ipa" --clobber
+          else
+            gh release create "$TAG" \
+              "$SOURCE_DIR/build/artifacts/Telegram.ipa" \
+              --title "Telegram iOS $APP_VERSION ($BUILD_NUMBER) unsigned" \
+              --notes "Unsigned Telegram iOS $APP_VERSION ($BUILD_NUMBER), built from the DIY configuration. Re-sign with your own signer (ESign / Sideloadly / AltStore)."
+          fi
